@@ -20,4 +20,4 @@ Note that the recipe is modified to:
 * Allow non-strict loading of the Qwen checkpoint as we have the extra BLT params
 * Specifically filter out the token embeddings, as we dump those in favor of learning a simple byte specific embedding (which hopefully doesn't do too much, but I haven't really ablated anything)
 
-For memory purposes the cross-attention is limited to the last 6 layers of the Qwen model. 
+For memory purposes the cross-attention is limited to the last 6 layers of the Qwen model - it runs in 24GB of VRAM, but pretty slowly (there is a definitely a lot to optimize and no profiling has been done).  
