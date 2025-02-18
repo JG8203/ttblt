@@ -12,6 +12,11 @@ from torchtune.modules import (
 from torchtune.modules.model_fusion import FusionLayer
 from torchtune.models.qwen2._component_builders import qwen2_mlp
 
+BOE_ID = 2
+BOS_ID = 1
+EOS_ID = 2
+PAD_ID = 0
+
 ################################################
 # Local encoder/decoder (with cross-attn)
 ################################################
@@ -203,6 +208,41 @@ def patch_reduce(h, patch_ids, reduce_op="mean"):
         include_self=False,
     )
     return reduced
+
+def compute_patch_size(so_far: torch.Tensor, threshold=3.0, max_patch=8):
+    """
+    heuristic function for deciding the patch length
+    based on dynamic_patch logic or local entropy.
+    
+    so_far: [seq_len] or [1, seq_len], the current context of tokens (including newly generated ones).
+    threshold: approximate bits threshold for deciding to break the patch.
+    max_patch: a max patch length to avoid overly large chunks.
+
+    Returns:
+        predicted_patch_size: int
+            the number of bytes to decode in the *next* patch in a single forward pass
+    """
+    # re-run dynamic_patch() on the entire sequence and see how big the last patch is. 
+    # this is probably pretty wasteful!s
+    # Then we decide how big the *next* patch would be if we continued. 
+    # This is a simple way to reuse your dynamic_patch code.
+    if so_far.dim() == 1:
+        so_far = so_far.unsqueeze(0)  # [batch=1, seq_len]
+    
+    patch_ids, _ = dynamic_patch(so_far, threshold=threshold, patch_size=max_patch)
+
+    # The ID of the last patch in that sequence:
+    last_patch_id = patch_ids[0, -1].item()  # e.g. 3 means patches 0..3
+    # Count how many tokens so far belong to the last patch
+    # (i.e. sum of patch_ids == last_patch_id)
+    count_last_patch = (patch_ids[0] == last_patch_id).sum().item()
+
+    # guess that the next patch might be similar in size:
+    # If we already used up to 'count_last_patch' tokens for the last patch,
+    # we can try the same or smaller for the next patch. A simple approach is:
+    predicted_size = max(1, min(count_last_patch, max_patch))
+
+    return predicted_size
 
 ################################################
 # Projection layer
@@ -423,16 +463,125 @@ class ByteLatentQwen2p5Decoder(TransformerDecoder):
 
         # Super handles chunking
         return local_logits
+    
+    def generate_with_patches(
+        self,
+        prompt: Union[torch.LongTensor, List[int]],
+        max_new_tokens: int = 128,
+        eos_id: int = EOS_ID,    # your EOS_ID
+        threshold: float = 3.0,
+        max_patch_size: int = 8,
+        temperature: float = 1.0,
+        top_k: int = 0
+    ) -> List[int]:
+        """
+        Generate up to `max_new_tokens` bytes using patch-based decoding.
+        We'll do a single forward pass for each 'patch' chunk, hopefully bigger than 1 byte
+        for efficiency. We do a simple step-by-step sampling inside that patch, but
+        *without* re-running the entire model each time.
+
+        Args:
+            prompt: initial list of bytes or a tensor shaped [seq_len]
+            max_new_tokens: total new bytes to produce
+            eos_id: ID for end-of-sequence
+            threshold: local entropy threshold for dynamic patch size
+            max_patch_size: maximum patch chunk we consider
+            temperature, top_k: sampling hyperparams
+
+        Returns:
+            all_tokens: a list of all bytes (prompt + newly generated)
+        """
+        if isinstance(prompt, list):
+            prompt = torch.tensor(prompt, dtype=torch.long, device=next(self.parameters()).device)
+        if prompt.dim() == 1:
+            prompt = prompt.unsqueeze(0)  # shape [1, seq_len]
+
+        all_tokens = prompt.clone()
+
+        # We'll keep track of how many new tokens we've added
+        generated_count = 0
+
+        while generated_count < max_new_tokens:
+            patch_len = compute_patch_size(all_tokens, threshold=threshold, max_patch=max_patch_size)
+            # Avoid going beyond max_new_tokens
+            patch_len = min(patch_len, max_new_tokens - generated_count)
+            if patch_len <= 0:
+                break
+
+            #    Do a single forward pass with the entire context
+            #    expecting patch_len more positions at the end. 
+            #    We'll set up a 'positions_to_predict' argument so that
+            #    the model's internal logic (Torchtune chunking, etc.) 
+            #    knows we want logits for the new positions.
+
+            current_seq_len = all_tokens.size(1)
+            # The model will produce logits for positions [current_seq_len .. current_seq_len + patch_len - 1]
+            # We can do that in a single pass by passing the entire tokens so far, extended with 
+            # some placeholder for the next 'patch_len' bytes. We'll fill them in step-by-step from the logits.
+            # But to avoid re-running the entire model for each new byte, let's do a single pass
+            # and store the logits for each new position.
+
+            # We'll create a new input, same as all_tokens, with 'patch_len' dummy tokens appended (e.g. pad_id).
+            # shape => [1, current_seq_len + patch_len]
+            padded_input = torch.cat([
+                all_tokens, 
+                torch.full((1, patch_len), self.tok_embeddings.padding_idx if hasattr(self.tok_embeddings, "padding_idx") else 0, device=all_tokens.device, dtype=all_tokens.dtype)
+            ], dim=1)
+
+            # Now do a forward pass
+            with torch.no_grad():
+                # The model returns logits for each position in [B, T, 256]
+                logits = self.forward(padded_input)  # shape [1, T, 256]
+                # If your forward returns chunked output, you might need to combine them:
+                if isinstance(logits, list):
+                    logits = torch.cat(logits, dim=1)  # [1, T, 256]
+            
+            # 4) Extract the *new* positions' logits: 
+            #    from current_seq_len..(current_seq_len + patch_len - 1)
+            #    shape => [patch_len, 256]
+            new_positions_logits = logits[0, current_seq_len : current_seq_len + patch_len, :]
+
+            # 5) Inside that patch, do step-by-step sampling from the stored logits
+            new_tokens = []
+            for i in range(patch_len):
+                step_logits = new_positions_logits[i]  # shape [256]
+                # Possibly adjust for temperature
+                if temperature != 1.0:
+                    step_logits = step_logits / temperature
+                
+                # Possibly do top_k
+                if top_k > 0:
+                    # topk filter
+                    values, indices = torch.topk(step_logits, top_k)
+                    topk_mask = torch.ones_like(step_logits, dtype=torch.bool)
+                    topk_mask[indices] = False
+                    step_logits[topk_mask] = float('-inf')
+
+                probs = step_logits.softmax(dim=-1)
+                next_token = torch.multinomial(probs, num_samples=1).item()
+
+                new_tokens.append(next_token)
+
+                # If EOS, we can end generation altogether
+                if next_token == eos_id:
+                    patch_len = i + 1  # we actually only used i+1 steps
+                    break
+
+            # 6) Append these newly generated tokens to all_tokens
+            new_tokens_t = torch.tensor(new_tokens, dtype=all_tokens.dtype, device=all_tokens.device).unsqueeze(0)
+            all_tokens = torch.cat([all_tokens, new_tokens_t], dim=1)
+            generated_count += len(new_tokens)
+
+            # If we hit eos in the middle of the patch, break
+            if new_tokens and new_tokens[-1] == eos_id:
+                break
+
+        return all_tokens
 
 
 ############################
 # Tokenizer
 ############################
-
-BOE_ID = 2
-BOS_ID = 1
-EOS_ID = 2
-PAD_ID = 0
 
 class ByteLatentModelTokenizer(nn.Module):
     def __init__(

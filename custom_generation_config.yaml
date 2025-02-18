@@ -39,8 +39,6 @@ prompt:
   system: null
   user: "Tell me a joke."
 max_new_tokens: 300
-temperature: 0.6 # 0.8 and 0.6 are popular values to try
-top_k: 300
 
 enable_kv_cache: False # Issue with cross-attention
 
