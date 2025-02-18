@@ -63,7 +63,6 @@ def build_local_encoder(
         )
         layers.append(layer)
 
-    # final LN plus an Identity for output
     local_encoder = TransformerDecoder(
         tok_embeddings=tok_embeddings,
         layers=layers,
@@ -150,7 +149,7 @@ def dynamic_patch(
     patch_lengths = torch.zeros(batch_size, dtype=torch.long, device=bytes_tensor.device)
 
     # Keep track of how many consecutive tokens we have processed w/o triggering any new patch
-    # so we can adjust threshold if we go too long (or too short)
+    # so we can adjust threshold if we go too long
     consecutive_no_trigger = 0
     
     for pos in range(seq_len):
@@ -175,7 +174,6 @@ def dynamic_patch(
             consecutive_no_trigger += 1
             # If we haven't triggered for a while, lower threshold so that we become more likely
             # to split in the future.
-            #  e.g. every N steps, or each step. Here we do each step
             threshold = max(threshold - threshold_step_down, min_threshold)
 
         patch_ids[:, pos] = current_patch
@@ -183,10 +181,14 @@ def dynamic_patch(
     return patch_ids, local_ent
 
 def patch_reduce(h, patch_ids, reduce_op="mean"):
-    # h: [batch_size, seq_len, emb_dim]
-    # patch_ids: [batch_size, seq_len]
-    # reduce_op: e.g. "mean", "amin", "amax"
-    # returns: [batch_size, num_patches, emb_dim]
+    """ 
+    Arguments:
+        h: [batch_size, seq_len, emb_dim]
+        patch_ids: [batch_size, seq_len]
+        reduce_op: e.g. "mean", "amin", "amax"
+    
+    returns: [batch_size, num_patches, emb_dim]
+    """
     batch_size, seq_len, emb_dim = h.shape
     num_patches = patch_ids.max().item() + 1  # patch IDs go from 0..max
 
@@ -336,7 +338,7 @@ class ByteLatentQwen2p5Decoder(TransformerDecoder):
                 v_proj=nn.Linear(embed_dim, num_kv_heads * head_dim, bias=True),
                 output_proj=nn.Linear(embed_dim, embed_dim, bias=False),
                 attn_dropout=qwen_cfg["attn_dropout"],
-                is_causal=False,  # cross-attn is typically non-causal
+                is_causal=False,  # cross-attn is typically non-causal\
             )
             cross_mlp = qwen2_mlp(dim=embed_dim, hidden_dim=qwen_cfg["intermediate_dim"])
             cross_layer = TransformerCrossAttentionLayer(
@@ -345,8 +347,6 @@ class ByteLatentQwen2p5Decoder(TransformerDecoder):
                 ca_norm=RMSNorm(embed_dim, eps=qwen_cfg["norm_eps"]),
                 mlp_norm=RMSNorm(embed_dim, eps=qwen_cfg["norm_eps"]),
             )
-
-            # Wrap existing layer + new cross-attn in a FusionLayer
             fused = FusionLayer(
                 layer=old_layer,       # existing self-attn + MLP
                 fusion_layer=cross_layer,
@@ -407,21 +407,22 @@ class ByteLatentQwen2p5Decoder(TransformerDecoder):
         patch_embs = self.patch_projector(patch_embs)
         
         # this is a list of chunk x [b, num_patches, 256]
+        # batch_size, dec_seq_len = tokens.shape
+        # _, n_patches, _ = patch_embs.shape
+        # # Create an all-True mask: [B, T, N]
+        # encoder_mask = patch_embs.new_ones(
+        #     (batch_size, dec_seq_len, n_patches), dtype=torch.bool
+        # )
         local_logits = super().forward(
             tokens,        
             mask=mask,
             encoder_input=patch_embs,
+            # encoder_mask=encoder_mask, # For generation.
             input_pos=input_pos,
         )
 
         # Super handles chunking
         return local_logits
-
-        # # Chunking for chunked loss. 
-        # if self.num_output_chunks > 0:
-        #     return list(local_logits.chunk(self.num_output_chunks, dim=1))
-        # else:
-        #     return local_logits
 
 
 ############################
@@ -524,7 +525,7 @@ def qwen2_5_blt(
     local_to_global_dim_proj=True,
 ) -> ByteLatentQwen2p5Decoder:
     qwen_cfg = dict(
-        vocab_size=151936,
+        vocab_size=151936, # Kinda irrelevant
         embed_dim=2048,
         num_layers=36,
         num_heads=16,
@@ -535,10 +536,9 @@ def qwen2_5_blt(
         norm_eps=1e-6,
     )
 
-    # If you want a purely byte-level local side, you might do smaller vocab
     local_enc_cfg = dict(
         vocab_size=256, 
-        embed_dim=2048, # Keeping same as Qwen, but I might want to make this projectable.
+        embed_dim=2048, # Keeping same as Qwen
         num_layers=4,
         num_heads=8,
         num_kv_heads=8,
@@ -556,6 +556,7 @@ def qwen2_5_blt(
         local_to_global_dim_proj=local_to_global_dim_proj,
         # Cross-attending every other layer to reduce memory usage. 
         # cross_attend_layers=list(range(0, qwen_cfg["num_layers"], 2))
+        cross_attend_layers=list(range(0, qwen_cfg["num_layers"], 3))
         # Alt last 6 layers
-        cross_attend_layers=range(qwen_cfg["num_layers"] - 6, qwen_cfg["num_layers"])
+        # cross_attend_layers=range(qwen_cfg["num_layers"] - 6, qwen_cfg["num_layers"])
     )

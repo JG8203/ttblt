@@ -8,23 +8,23 @@
 # To launch, run the following command from root torchtune directory:
 #    tune run generate --config generation
 
-output_dir: /tmp/torchtune/qwen2_5_3B/full_single_device
+output_dir: /tmp/torchtune/qwen2_5_3B_blt/generate
 
 # Model arguments
 model:
   _component_: ttblt.bltqwen.qwen2_5_blt
 
 checkpointer:
-  _component_: torchtune.training.FullModelHFCheckpointer
-  checkpoint_dir: /tmp/Llama-3.2-1B-Instruct/
+  _component_: torchtune.training.FullModelMetaCheckpointer
+  checkpoint_dir: /tmp/torchtune/qwen2_5_3B_blt/full_single_device/epoch_0
   checkpoint_files: [
-    model.safetensors
+    adapter_model.pt
   ]
   recipe_checkpoint: null
   output_dir: ${output_dir}
-  model_type: LLAMA3_2
+  model_type: REWARD
 
-device: cuda
+device: cuda:1
 dtype: bf16
 
 seed: 1234
@@ -37,11 +37,11 @@ tokenizer:
 # Generation arguments; defaults taken from gpt-fast
 prompt:
   system: null
-  user: "Conversation between User and Assistant. The user asks a question, and the Assistant solves it. The assistant first thinks about the reasoning process in their mind and then provides the user with the answer. The reasoning process and answer are enclosed within <think> </think> and <answer> </answer> tags, respectively, i.e., <think> reasoning process here </think> <answer> answer here </answer>. At a recent fishing tournament, Alex caught 7 times as many fish as Jacob. Jacob did not think that he had any chance of winning, but Alex became overconfident and knocked over his bucket of fish, losing 23 fish back to the lake. If Jacob had 8 fish at the beginning, how many more fish does he need to catch to beat Alex by just 1 fish?"
+  user: "Tell me a joke."
 max_new_tokens: 300
 temperature: 0.6 # 0.8 and 0.6 are popular values to try
 top_k: 300
 
-enable_kv_cache: True
+enable_kv_cache: False # Issue with cross-attention
 
 quantizer: null

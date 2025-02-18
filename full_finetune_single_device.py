@@ -201,6 +201,17 @@ class FullFinetuneRecipeSingleDevice(FTRecipeInterface):
         )
         checkpoint_dict = self._checkpointer.load_checkpoint()
 
+        # TODO: Hackery! We are creating a different model from this one, 
+        # I should look up a good way to do that.
+        cfg_meta_checkpointer =  cfg_checkpointer
+        cfg_meta_checkpointer["_component_"] = "torchtune.training.FullModelMetaCheckpointer"
+        cfg_meta_checkpointer["checkpoint_files"] = ["model-00001-of-00002.safetensors"]
+        training.ADAPTER_KEY = training.MODEL_KEY
+        self._save_checkpointer = config.instantiate(
+            cfg_meta_checkpointer,
+        )
+
+        # TODO: this wont work. 
         if self._resume_from_checkpoint:
             self._update_recipe_state(checkpoint_dict)
         return checkpoint_dict
@@ -611,7 +622,9 @@ class FullFinetuneRecipeSingleDevice(FTRecipeInterface):
         Save state dict to file. The recipe save_checkpoint method is responsible for
         correctly creating the checkpoint dict and passing to the checkpointer.
         """
-        ckpt_dict = {training.MODEL_KEY: self._model.state_dict()}
+        # TODO: Hacked to use another checkpointer, and using the adapter flag to
+        # get the state dict saved. 
+        ckpt_dict = {training.ADAPTER_KEY: self._model.state_dict()}
         # if training is in-progress, checkpoint the optimizer state as well
         if epoch + 1 < self.total_epochs:
             ckpt_dict.update(
@@ -626,10 +639,11 @@ class FullFinetuneRecipeSingleDevice(FTRecipeInterface):
                 ckpt_dict[training.OPT_KEY] = self._optimizer.state_dict()
             else:
                 ckpt_dict[training.OPT_KEY] = self._optim_ckpt_wrapper.state_dict()
-        self._checkpointer.save_checkpoint(
+        self._save_checkpointer.save_checkpoint(
             ckpt_dict,
             epoch=epoch,
             intermediate_checkpoint=(epoch + 1 < self.total_epochs),
+            adapter_only=True
         )
 
     def _loss_step(self, batch: Dict[str, torch.Tensor]) -> torch.Tensor:
@@ -784,6 +798,10 @@ class FullFinetuneRecipeSingleDevice(FTRecipeInterface):
                 # Note we are stepping each batch, which might not include optimizer step in the trace
                 # if the schedule cycle doesn't align with gradient accumulation.
                 self._profiler.step()
+
+                # TODO: hack, take some intemediate checkpoints. 
+                if idx % 2000 == 0:
+                    self.save_checkpoint(epoch=curr_epoch+(idx//2000))
 
             self.epochs_run += 1
             self.save_checkpoint(epoch=curr_epoch)
