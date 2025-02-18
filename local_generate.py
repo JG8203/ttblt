@@ -142,7 +142,9 @@ class InferenceRecipe:
         t0 = time.perf_counter()
         generated_tokens = self._model.generate_with_patches(
             prompt, 
-            max_new_tokens=cfg.max_new_tokens
+            max_new_tokens=cfg.max_new_tokens,
+            temperature=cfg.temperature,
+            top_k=cfg.top_k,
         )
         generated_tokens = generated_tokens.tolist()
         t = time.perf_counter() - t0

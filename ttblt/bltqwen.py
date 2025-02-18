@@ -518,14 +518,20 @@ class ByteLatentQwen2p5Decoder(TransformerDecoder):
             # The model will produce logits for positions [current_seq_len .. current_seq_len + patch_len - 1]
             # We can do that in a single pass by passing the entire tokens so far, extended with 
             # some placeholder for the next 'patch_len' bytes. We'll fill them in step-by-step from the logits.
-            # But to avoid re-running the entire model for each new byte, let's do a single pass
-            # and store the logits for each new position.
+
+            fill_value = 0  # default
+            if hasattr(self.tok_embeddings, "padding_idx") and (self.tok_embeddings.padding_idx is not None):
+                fill_value = self.tok_embeddings.padding_idx
 
             # We'll create a new input, same as all_tokens, with 'patch_len' dummy tokens appended (e.g. pad_id).
             # shape => [1, current_seq_len + patch_len]
             padded_input = torch.cat([
                 all_tokens, 
-                torch.full((1, patch_len), self.tok_embeddings.padding_idx if hasattr(self.tok_embeddings, "padding_idx") else 0, device=all_tokens.device, dtype=all_tokens.dtype)
+                torch.full(
+                    (1, patch_len), 
+                    fill_value=fill_value, 
+                    device=all_tokens.device, 
+                    dtype=all_tokens.dtype)
             ], dim=1)
 
             # Now do a forward pass

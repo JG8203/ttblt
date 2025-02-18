@@ -16,7 +16,7 @@ model:
 
 checkpointer:
   _component_: torchtune.training.FullModelMetaCheckpointer
-  checkpoint_dir: /tmp/torchtune/qwen2_5_3B_blt/full_single_device/epoch_0
+  checkpoint_dir: /tmp/torchtune/qwen2_5_3B_blt/full_single_device/epoch_3
   checkpoint_files: [
     adapter_model.pt
   ]
@@ -37,8 +37,10 @@ tokenizer:
 # Generation arguments; defaults taken from gpt-fast
 prompt:
   system: null
-  user: "Tell me a joke."
+  user: "Tell me a joke.\n"
 max_new_tokens: 300
+temperature: 0.3
+top_k: 25 # Smaller, bytes! 
 
 enable_kv_cache: False # Issue with cross-attention
 
