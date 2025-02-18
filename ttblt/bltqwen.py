@@ -477,8 +477,7 @@ class ByteLatentQwen2p5Decoder(TransformerDecoder):
         """
         Generate up to `max_new_tokens` bytes using patch-based decoding.
         We'll do a single forward pass for each 'patch' chunk, hopefully bigger than 1 byte
-        for efficiency. We do a simple step-by-step sampling inside that patch, but
-        *without* re-running the entire model each time.
+        for efficiency. We do a simple step-by-step sampling inside that patch.
 
         Args:
             prompt: initial list of bytes or a tensor shaped [seq_len]
@@ -508,12 +507,6 @@ class ByteLatentQwen2p5Decoder(TransformerDecoder):
             if patch_len <= 0:
                 break
 
-            #    Do a single forward pass with the entire context
-            #    expecting patch_len more positions at the end. 
-            #    We'll set up a 'positions_to_predict' argument so that
-            #    the model's internal logic (Torchtune chunking, etc.) 
-            #    knows we want logits for the new positions.
-
             current_seq_len = all_tokens.size(1)
             # The model will produce logits for positions [current_seq_len .. current_seq_len + patch_len - 1]
             # We can do that in a single pass by passing the entire tokens so far, extended with 
@@ -538,16 +531,13 @@ class ByteLatentQwen2p5Decoder(TransformerDecoder):
             with torch.no_grad():
                 # The model returns logits for each position in [B, T, 256]
                 logits = self.forward(padded_input)  # shape [1, T, 256]
-                # If your forward returns chunked output, you might need to combine them:
+                # Chunked.
                 if isinstance(logits, list):
                     logits = torch.cat(logits, dim=1)  # [1, T, 256]
             
-            # 4) Extract the *new* positions' logits: 
-            #    from current_seq_len..(current_seq_len + patch_len - 1)
-            #    shape => [patch_len, 256]
             new_positions_logits = logits[0, current_seq_len : current_seq_len + patch_len, :]
 
-            # 5) Inside that patch, do step-by-step sampling from the stored logits
+            # Inside a patch do step-by-step sampling from the stored logits
             new_tokens = []
             for i in range(patch_len):
                 step_logits = new_positions_logits[i]  # shape [256]
@@ -573,7 +563,6 @@ class ByteLatentQwen2p5Decoder(TransformerDecoder):
                     patch_len = i + 1  # we actually only used i+1 steps
                     break
 
-            # 6) Append these newly generated tokens to all_tokens
             new_tokens_t = torch.tensor(new_tokens, dtype=all_tokens.dtype, device=all_tokens.device).unsqueeze(0)
             all_tokens = torch.cat([all_tokens, new_tokens_t], dim=1)
             generated_count += len(new_tokens)
