@@ -268,7 +268,9 @@ class ByteLatentQwen2p5Decoder(TransformerDecoder):
         freeze_global_for_n_steps: int = 0,
         local_to_global_dim_proj: bool = True,
         cross_attend_layers: Optional[List[int]] = None,
+        twox_pooling: bool = False,
     ):
+        self.twox_pooling = twox_pooling
         layers = nn.ModuleList()
         head_dim = qwen_cfg['embed_dim'] // qwen_cfg['num_heads']
 
@@ -339,6 +341,9 @@ class ByteLatentQwen2p5Decoder(TransformerDecoder):
 
         if local_to_global_dim_proj:
             local_dim = local_encoder_cfg['embed_dim']
+            # Double up if pooling
+            if self.twox_pooling:
+                local_dim = local_dim * 2
             global_dim = qwen_cfg['embed_dim']
             #self.layers[0].attn.q_proj.in_features  # typically same as embed_dim but could differ
             self.patch_projector = PatchToGlobalProjector(local_dim, global_dim)
@@ -443,7 +448,13 @@ class ByteLatentQwen2p5Decoder(TransformerDecoder):
         patch_ids, tok_scores = dynamic_patch(
             tokens, threshold=self.patching_threshold, patch_size=self.patch_size
         )
-        patch_embs = patch_reduce(local_enc_out, patch_ids, reduce_op="mean")
+        if self.twox_pooling:
+            mean_embs = patch_reduce(local_enc_out, patch_ids, reduce_op="mean")
+            max_embs  = patch_reduce(local_enc_out, patch_ids, reduce_op="amax")
+            patch_embs = torch.cat([mean_embs, max_embs], dim=-1)
+        else:
+            patch_embs = patch_reduce(local_enc_out, patch_ids, reduce_op="mean")
+        
         patch_embs = self.patch_projector(patch_embs)
         
         # this is a list of chunk x [b, num_patches, 256]
@@ -667,6 +678,7 @@ def qwen2_5_blt(
     # the warmup, but never tested a longer warmup. 
     freeze_global_for_n_steps=0, 
     local_to_global_dim_proj=True,
+    twox_pooling=False,
 ) -> ByteLatentQwen2p5Decoder:
     qwen_cfg = dict(
         vocab_size=151936, # Kinda irrelevant
@@ -700,7 +712,8 @@ def qwen2_5_blt(
         local_to_global_dim_proj=local_to_global_dim_proj,
         # Cross-attending every other layer to reduce memory usage. 
         # cross_attend_layers=list(range(0, qwen_cfg["num_layers"], 2))
-        cross_attend_layers=list(range(0, qwen_cfg["num_layers"], 3))
+        cross_attend_layers=list(range(0, qwen_cfg["num_layers"], 3)),
         # Alt last 6 layers
         # cross_attend_layers=range(qwen_cfg["num_layers"] - 6, qwen_cfg["num_layers"])
+        twox_pooling=twox_pooling,
     )
