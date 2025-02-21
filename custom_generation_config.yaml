@@ -13,10 +13,12 @@ output_dir: /tmp/torchtune/qwen2_5_3B_blt/generate
 # Model arguments
 model:
   _component_: ttblt.bltqwen.qwen2_5_blt
+  twox_pooling: 1
 
 checkpointer:
   _component_: torchtune.training.FullModelMetaCheckpointer
-  checkpoint_dir: /tmp/torchtune/qwen2_5_3B_blt/full_single_device/epoch_3
+  checkpoint_dir: /tmp/torchtune/qwen2_5_3B_blt_test/full_single_device/epoch_3
+  #checkpoint_dir: /tmp/torchtune/qwen2_5_3B_blt/full_single_device/epoch_3
   checkpoint_files: [
     adapter_model.pt
   ]

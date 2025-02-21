@@ -21,7 +21,51 @@ PAD_ID = 0
 # Local encoder/decoder (with cross-attn)
 ################################################
 
+class LocalEncoderWithPooling(nn.Module):
+    def __init__(self, base_encoder, cross_attn_layers, twox_pooling, embed_dim, global_dim):
+        super().__init__()
+        self.base_encoder = base_encoder
+        self.cross_attn_layers = cross_attn_layers
+        self.twox_pooling = twox_pooling
+
+        if twox_pooling:
+            #self.layers[0].attn.q_proj.in_features  # typically same as embed_dim but could differ
+            self.patch_projector = PatchToGlobalProjector(embed_dim * 2, global_dim)
+        else:
+            self.patch_projector = nn.Identity()
+
+    def forward(self, tokens, patch_ids):
+        # Get byte embeddings
+        byte_embeds = self.base_encoder(tokens, mask=None)
+        # TODO: remove this hack. If not using chunked output, TransformerDecoder called .float
+        # on the output, annoyingly throwing us into float32. 
+        byte_embeds = byte_embeds.to(torch.bfloat16)
+
+        # Pool byte embeddings into patch embeddings
+        if self.twox_pooling:
+            mean_embs = patch_reduce(byte_embeds, patch_ids, reduce_op="mean")
+            max_embs  = patch_reduce(byte_embeds, patch_ids, reduce_op="amax")
+            patch_embs = torch.cat([mean_embs, max_embs], dim=-1)
+        else:
+            patch_embs = patch_reduce(byte_embeds, patch_ids, reduce_op="mean")
+
+        # Projection to global layers/cross attention.
+        patch_embs = self.patch_projector(patch_embs)
+
+        # Refine with cross-attention if present
+        if self.cross_attn_layers:
+            num_patches = patch_ids.max().item() + 1
+            local_encoder_mask = (
+                patch_ids.unsqueeze(1) ==
+                torch.arange(num_patches, device=tokens.device).unsqueeze(0).unsqueeze(-1)
+            )  # [batch_size, num_patches, seq_len]
+            for cross_layer in self.cross_attn_layers:
+                patch_embs = cross_layer(patch_embs, encoder_input=byte_embeds, encoder_mask=local_encoder_mask)
+
+        return patch_embs
+
 def build_local_encoder(
+    global_dim: int,
     vocab_size: int = 256,
     embed_dim: int = 2048,
     num_heads: int = 8,
@@ -31,6 +75,8 @@ def build_local_encoder(
     attn_dropout: float = 0.0,
     max_seq_len: int = 2048,
     num_layers: int = 4,
+    num_cross_layers = 1,
+    twox_pooling: bool = False,
     dtype=torch.bfloat16
 ):
     """
@@ -58,6 +104,7 @@ def build_local_encoder(
             output_proj=nn.Linear(embed_dim, embed_dim, bias=False),
             max_seq_len=max_seq_len,
             attn_dropout=attn_dropout,
+            is_causal=True,
         )
         mlp = qwen2_mlp(dim=embed_dim, hidden_dim=hidden_dim)
         layer = TransformerSelfAttentionLayer(
@@ -68,7 +115,7 @@ def build_local_encoder(
         )
         layers.append(layer)
 
-    local_encoder = TransformerDecoder(
+    base_encoder = TransformerDecoder(
         tok_embeddings=tok_embeddings,
         layers=layers,
         max_seq_len=max_seq_len,
@@ -77,8 +124,34 @@ def build_local_encoder(
         norm=RMSNorm(embed_dim, eps=norm_eps),
         output=nn.Identity(),  # no final projection
     )
-    local_encoder = local_encoder.to(dtype=dtype)
-    return local_encoder
+
+    # Cross-attention layers (optional)
+    cross_attn_layers = nn.ModuleList()
+    for _ in range(num_cross_layers):
+        cross_attn = MultiHeadAttention(
+            embed_dim=global_dim,
+            num_heads=num_heads,
+            num_kv_heads=num_kv_heads,
+            head_dim=head_dim,
+            q_proj=nn.Linear(global_dim, num_heads * head_dim, bias=True),
+            k_proj=nn.Linear(global_dim, num_kv_heads * head_dim, bias=True),
+            v_proj=nn.Linear(global_dim, num_kv_heads * head_dim, bias=True),
+            output_proj=nn.Linear(global_dim, global_dim, bias=False),
+            max_seq_len=max_seq_len,
+            attn_dropout=attn_dropout,
+            is_causal=False,
+        )
+        mlp = qwen2_mlp(dim=embed_dim, hidden_dim=hidden_dim)
+        cross_layer = TransformerCrossAttentionLayer(
+            attn=cross_attn,
+            mlp=mlp,
+            ca_norm=RMSNorm(global_dim, eps=norm_eps),
+            mlp_norm=RMSNorm(global_dim, eps=norm_eps),
+        )
+        cross_attn_layers.append(cross_layer)
+    
+    local_encoder = LocalEncoderWithPooling(base_encoder, cross_attn_layers, twox_pooling, embed_dim, global_dim)
+    return local_encoder.to(dtype=dtype)
 
 ################################################
 # dynamic patching
@@ -266,11 +339,8 @@ class ByteLatentQwen2p5Decoder(TransformerDecoder):
         patch_size: int = 4,
         patching_threshold: float = 3.0,
         freeze_global_for_n_steps: int = 0,
-        local_to_global_dim_proj: bool = True,
         cross_attend_layers: Optional[List[int]] = None,
-        twox_pooling: bool = False,
     ):
-        self.twox_pooling = twox_pooling
         layers = nn.ModuleList()
         head_dim = qwen_cfg['embed_dim'] // qwen_cfg['num_heads']
 
@@ -323,35 +393,43 @@ class ByteLatentQwen2p5Decoder(TransformerDecoder):
             norm=RMSNorm(qwen_cfg['embed_dim'], eps=qwen_cfg['norm_eps']),
             # We are overriding this to be bytes, ignoring the tokenizer. 
             output=output,
-            # We want the last hidden state for cross attending. 
-            # output_hidden_states=[qwen_cfg['num_layers']-1]
         )
 
         if cross_attend_layers is None:
             cross_attend_layers = [qwen_cfg["num_layers"] - 1]  # e.g. only final layer
         self._inject_cross_attn(self, qwen_cfg, cross_attend_layers)
 
-        self.local_encoder = build_local_encoder(**local_encoder_cfg)
+        self.local_encoder = build_local_encoder(**local_encoder_cfg, global_dim=qwen_cfg['embed_dim'])
 
         self.patch_size = patch_size
         self.patching_threshold = patching_threshold
         self.freeze_global_for_n_steps = freeze_global_for_n_steps
         self.current_step = 0
         self.global_frozen = freeze_global_for_n_steps > 0
-
-        if local_to_global_dim_proj:
-            local_dim = local_encoder_cfg['embed_dim']
-            # Double up if pooling
-            if self.twox_pooling:
-                local_dim = local_dim * 2
-            global_dim = qwen_cfg['embed_dim']
-            #self.layers[0].attn.q_proj.in_features  # typically same as embed_dim but could differ
-            self.patch_projector = PatchToGlobalProjector(local_dim, global_dim)
-        else:
-            self.patch_projector = nn.Identity()
+        if self.global_frozen:
+            self._update_freezing()
 
         # We'll store how many chunks the user wants for final output
         self.num_output_chunks = 0  # default
+
+        # Collect parameters for different learning rates
+        self.qwen_params = []
+        self.new_params = []
+
+        # Qwen parts
+        self.qwen_params.extend(self.norm.parameters())
+        for layer in self.layers:
+            if isinstance(layer, TransformerSelfAttentionLayer):
+                self.qwen_params.extend(layer.parameters())
+            elif isinstance(layer, FusionLayer):
+                self.qwen_params.extend(layer.layer.parameters())
+                # New cross-attention parts
+                self.new_params.extend(layer.fusion_layer.parameters())
+
+        # New parts
+        self.new_params.extend(self.tok_embeddings.parameters())
+        self.new_params.extend(self.output.parameters())
+        self.new_params.extend(self.local_encoder.parameters())
 
     def _inject_cross_attn(
         self,
@@ -399,6 +477,22 @@ class ByteLatentQwen2p5Decoder(TransformerDecoder):
             )
             decoder.layers[idx] = fused  # replace it in place
 
+    def _update_freezing(self):
+        if self.global_frozen:
+            for param in self.norm.parameters():
+                param.requires_grad = False
+            for layer in self.layers:
+                if isinstance(layer, TransformerSelfAttentionLayer):
+                    for param in layer.parameters():
+                        param.requires_grad = False
+                elif isinstance(layer, FusionLayer):
+                    for param in layer.layer.parameters():
+                        param.requires_grad = False
+                    # fusion_layer parameters remain requires_grad = True
+        else:
+            for param in self.parameters():
+                param.requires_grad = True
+
     def set_num_output_chunks(self, num_output_chunks: int) -> None:
         super().set_num_output_chunks(num_output_chunks)
         self.num_output_chunks = num_output_chunks
@@ -412,63 +506,38 @@ class ByteLatentQwen2p5Decoder(TransformerDecoder):
         encoder_mask: Optional[torch.Tensor] = None,
         input_pos: Optional[torch.Tensor] = None,
     ) -> Union[torch.Tensor, List[torch.Tensor]]:
-        # Freeze/unfreeze global if needed
-        if self.global_frozen:
-            for param in self.norm.parameters():
-                param.requires_grad = False
-            for layer in self.layers:
-                for p in layer.parameters():
-                    p.requires_grad = False
-            for p in self.output.parameters():
-                p.requires_grad = False
-            # if there’s a tok_embeddings for global
-            for p in self.tok_embeddings.parameters():
-                p.requires_grad = False
-        else:
-            for param in self.norm.parameters():
-                param.requires_grad = True
-            for layer in self.layers:
-                for p in layer.parameters():
-                    p.requires_grad = True
-            for p in self.output.parameters():
-                p.requires_grad = True
-            for p in self.tok_embeddings.parameters():
-                p.requires_grad = True
-
+        # Update freezing state if in training
         if self.training and self.global_frozen:
             self.current_step += 1
             if self.current_step >= self.freeze_global_for_n_steps:
-                self.global_frozen = False  # unfreeze
+                self.global_frozen = False
+                self._update_freezing()
         
-        local_enc_out = self.local_encoder(tokens)
-        # TODO: remove this hack. If not using chunked output, TransformerDecoder called .float
-        # on the output, annoyingly throwing us into float32. 
-        local_enc_out = local_enc_out.to(torch.bfloat16)
-        
+        # Compute patch IDs
         patch_ids, tok_scores = dynamic_patch(
             tokens, threshold=self.patching_threshold, patch_size=self.patch_size
+        ) 
+
+        # Get patch embeddings from local encoder
+        patch_embs = self.local_encoder(tokens, patch_ids=patch_ids)
+        
+        # Compute decoder cross-attention mask
+        batch_size, seq_len = tokens.shape
+        num_patches = patch_embs.size(1)
+        decoder_cross_mask = torch.zeros(
+            batch_size, seq_len, num_patches, dtype=torch.bool, device=tokens.device
         )
-        if self.twox_pooling:
-            mean_embs = patch_reduce(local_enc_out, patch_ids, reduce_op="mean")
-            max_embs  = patch_reduce(local_enc_out, patch_ids, reduce_op="amax")
-            patch_embs = torch.cat([mean_embs, max_embs], dim=-1)
-        else:
-            patch_embs = patch_reduce(local_enc_out, patch_ids, reduce_op="mean")
-        
-        patch_embs = self.patch_projector(patch_embs)
-        
+        decoder_cross_mask[
+            torch.arange(batch_size)[:, None],
+            torch.arange(seq_len)[None, :],
+            patch_ids
+        ] = True
         # this is a list of chunk x [b, num_patches, 256]
-        # batch_size, dec_seq_len = tokens.shape
-        # _, n_patches, _ = patch_embs.shape
-        # # Create an all-True mask: [B, T, N]
-        # encoder_mask = patch_embs.new_ones(
-        #     (batch_size, dec_seq_len, n_patches), dtype=torch.bool
-        # )
         local_logits = super().forward(
             tokens,        
             mask=mask,
             encoder_input=patch_embs,
-            # encoder_mask=encoder_mask, # For generation.
+            encoder_mask=decoder_cross_mask,
             input_pos=input_pos,
         )
 
@@ -676,9 +745,8 @@ def blt_tokenizer(
 def qwen2_5_blt(
     # Warm up decoder/encoder. Tried it with both 100 and 0 and it seemed to work better without
     # the warmup, but never tested a longer warmup. 
-    freeze_global_for_n_steps=0, 
-    local_to_global_dim_proj=True,
-    twox_pooling=False,
+    freeze_global_for_n_steps=500, 
+    twox_pooling=True,
 ) -> ByteLatentQwen2p5Decoder:
     qwen_cfg = dict(
         vocab_size=151936, # Kinda irrelevant
@@ -701,6 +769,8 @@ def qwen2_5_blt(
         max_seq_len=4096,
         hidden_dim=4096,
         norm_eps=1e-5,
+        num_cross_layers = 1,
+        twox_pooling = twox_pooling,
     )
 
     return ByteLatentQwen2p5Decoder(
@@ -709,11 +779,9 @@ def qwen2_5_blt(
         patch_size=4,
         patching_threshold=3.0,
         freeze_global_for_n_steps=freeze_global_for_n_steps,
-        local_to_global_dim_proj=local_to_global_dim_proj,
         # Cross-attending every other layer to reduce memory usage. 
         # cross_attend_layers=list(range(0, qwen_cfg["num_layers"], 2))
         cross_attend_layers=list(range(0, qwen_cfg["num_layers"], 3)),
         # Alt last 6 layers
         # cross_attend_layers=range(qwen_cfg["num_layers"] - 6, qwen_cfg["num_layers"])
-        twox_pooling=twox_pooling,
     )

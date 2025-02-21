@@ -481,10 +481,26 @@ class FullFinetuneRecipeSingleDevice(FTRecipeInterface):
         """
         if optimizer_in_bwd:
             # Maintain a dict of optims for every parameter.
-            optim_dict = {
-                p: config.instantiate(cfg_optimizer, [p])
-                for p in self._model.parameters()
-            }
+            if cfg_optimizer.get("base_model_lr", None) is None:
+                optim_dict = {
+                    p: config.instantiate(cfg_optimizer, [p])
+                    for p in self._model.parameters()
+                }
+            else:
+                cfg_optimizer_base = cfg_optimizer.copy()
+                cfg_optimizer_base.lr = cfg_optimizer_base.base_model_lr
+                del cfg_optimizer_base["base_model_lr"]
+                cfg_optimizer_new = cfg_optimizer
+                del cfg_optimizer_new["base_model_lr"]
+                optim_dict = {
+                    p: config.instantiate(cfg_optimizer_new, [p])
+                    for p in self._model.new_params
+                }
+                optim_dict_b = {
+                    p: config.instantiate(cfg_optimizer_base, [p])
+                    for p in self._model.qwen_params
+                }
+                optim_dict = {**optim_dict, **optim_dict_b}
             # Register optimizer step hooks on the model to run optimizer in backward.
             training.register_optim_in_bwd_hooks(
                 model=self._model, optim_dict=optim_dict
@@ -507,6 +523,7 @@ class FullFinetuneRecipeSingleDevice(FTRecipeInterface):
             log.info("In-backward optimizers are set up.")
             return None
         else:
+            # TODO: doesn't support split learning rates!
             optimizer = config.instantiate(cfg_optimizer, self._model.parameters())
 
             if opt_state_dict:
@@ -800,7 +817,7 @@ class FullFinetuneRecipeSingleDevice(FTRecipeInterface):
                 self._profiler.step()
 
                 # TODO: hack, take some intemediate checkpoints. 
-                if idx % 2000 == 0:
+                if idx % 2000 == 0 and idx > 0:
                     self.save_checkpoint(epoch=curr_epoch+(idx//2000))
 
             self.epochs_run += 1
