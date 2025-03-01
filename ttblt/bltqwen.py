@@ -12,61 +12,254 @@ from torchtune.modules import (
 from torchtune.modules.model_fusion import FusionLayer
 from torchtune.models.qwen2._component_builders import qwen2_mlp
 
-BOE_ID = 2
-BOS_ID = 1
-EOS_ID = 2
-PAD_ID = 0
+PAD_ID = 256
+BOS_ID = 257
+EOS_ID = 258
+NUM_SPECIAL_TOKENS = 3
+VOCAB_SIZE = 256 + NUM_SPECIAL_TOKENS  
 
 ################################################
 # Local encoder/decoder (with cross-attn)
 ################################################
 
+class HashNGramEmbedder(nn.Module):
+    """
+    Wraps a main byte embedding plus additional hash-based
+    n-gram embedding lookups. Two modes are supported:
+    
+    1. Separate tables mode (default): One embedding table per n in [3, max_n].
+    2. Shared table mode (if shared_table=True): A single embedding table is used
+       for all n-gram sizes.
+       
+    When using the shared table mode, a learned n-gram size embedding is added so that the model can
+    distinguish among n-gram lengths.
+    
+    The final embedding at each position is:
+       main_embed(byte) + sum_{n in 3..max_n} (ngram_embed [+ ngram_size_embed if shared])
+    """
+    def __init__(
+        self,
+        embed_dim: int = 2048,
+        max_n: int = 8,
+        num_buckets: int = 500_000,
+        vocab_size: int = 256,
+        hash_base: int = 257,
+        hash_mod: int = 2**23,
+        shared_table: bool = True  # switchable mode
+    ):
+        super().__init__()
+        self.embed_dim = embed_dim
+        self.max_n = max_n
+        self.num_buckets = num_buckets
+        self.hash_base = hash_base
+        self.hash_mod = hash_mod
+        self.shared_table = shared_table
+
+        # Main byte embedding.
+        self.main_embed = nn.Embedding(vocab_size, embed_dim)
+
+        if shared_table:
+            # One shared table for all n-gram sizes.
+            self.shared_ngram_table = nn.Embedding(num_buckets, embed_dim)
+            nn.init.normal_(self.shared_ngram_table.weight, mean=0.0, std=0.02)
+            # n-gram size embedding: one learned vector per n in [3, max_n]
+            # (max_n - 2) distinct n values.
+            self.ngram_size_embed = nn.Embedding(max_n - 2, embed_dim)
+            nn.init.normal_(self.ngram_size_embed.weight, mean=0.0, std=0.02)
+        else:
+            # Separate table per n-gram size.
+            self.ngram_tables = nn.ModuleDict()
+            for n in range(3, max_n + 1):
+                table = nn.Embedding(num_buckets, embed_dim)
+                nn.init.normal_(table.weight, mean=0.0, std=0.02)
+                self.ngram_tables[str(n)] = table
+
+        # Precompute powers for rolling hash for each n in [3, max_n] using modular exponentiation.
+        for n in range(3, max_n + 1):
+            powers_list = [pow(hash_base, n - 1 - k, hash_mod) for k in range(n)]
+            powers = torch.tensor(powers_list, dtype=torch.int32)
+            self.register_buffer(f'powers_{n}', powers)
+
+    def forward(self, tokens: torch.LongTensor) -> torch.Tensor:
+        """
+        tokens: [batch_size, seq_len] of byte IDs in [0..255].
+        Returns final embeddings of shape [batch_size, seq_len, embed_dim].
+        All hash arithmetic is done in int32.
+        """
+        bsz, seq_len = tokens.shape
+        if seq_len == 0:
+            return torch.empty(bsz, 0, self.embed_dim, device=tokens.device)
+
+        # Main byte embedding.
+        out = self.main_embed(tokens)  # [bsz, seq_len, embed_dim]
+
+        # For each n-gram size, compute and add n-gram embeddings.
+        for n in range(3, self.max_n + 1):
+            if seq_len < n:
+                continue
+
+            powers = getattr(self, f'powers_{n}')  # shape: [n]
+            ngrams = tokens.unfold(1, n, 1).to(torch.int32)  # [bsz, seq_len - n + 1, n]
+            if ngrams.numel() == 0:
+                continue
+
+            temp = (ngrams * powers.unsqueeze(0).unsqueeze(0)) % self.hash_mod
+            hashed_vals = temp.sum(dim=2) % self.hash_mod  # [bsz, seq_len - n + 1]
+
+            hashed_idxs = torch.zeros((bsz, seq_len), dtype=torch.int32, device=tokens.device)
+            hashed_idxs[:, n - 1:] = hashed_vals
+            hashed_idxs = hashed_idxs % self.num_buckets
+
+            if self.shared_table:
+                ngram_embed = self.shared_ngram_table(hashed_idxs.long())  # [bsz, seq_len, embed_dim]
+                # Add n-gram size embedding only in shared mode.
+                size_embed = self.ngram_size_embed(torch.tensor(n - 3, device=tokens.device))
+                size_embed = size_embed.unsqueeze(0).unsqueeze(0)  # [1, 1, embed_dim]
+                ngram_embed = ngram_embed + size_embed
+            else:
+                table = self.ngram_tables[str(n)]
+                ngram_embed = table(hashed_idxs.long())
+
+            out += ngram_embed
+
+        num_contrib = 1 + (self.max_n - 2)  # main embedding + contributions for each n from 3 to max_n
+        out = out / num_contrib
+        return out
+
+class LocalDecoder(nn.Module):
+    def __init__(
+        self,
+        embed_dim: int,
+        global_dim: int,
+        vocab_size: int,
+        num_layers: int = 8,
+        num_cross_layers: int = 4,
+        num_heads: int = 8,
+        num_kv_heads: int = 8,
+        hidden_dim: int = 4096,
+        norm_eps: float = 1e-5,
+        attn_dropout: float = 0.0,
+        max_seq_len: int = 2048,
+        dtype=torch.bfloat16,
+    ):
+        super().__init__()
+        head_dim = embed_dim // num_heads
+        
+        # Self-attention layers
+        layers = nn.ModuleList()
+        for _ in range(num_layers):
+            self_attn = MultiHeadAttention(
+                embed_dim=embed_dim,
+                num_heads=num_heads,
+                num_kv_heads=num_kv_heads,
+                head_dim=head_dim,
+                q_proj=nn.Linear(embed_dim, num_heads * head_dim, bias=True),
+                k_proj=nn.Linear(embed_dim, num_kv_heads * head_dim, bias=True),
+                v_proj=nn.Linear(embed_dim, num_kv_heads * head_dim, bias=True),
+                output_proj=nn.Linear(embed_dim, embed_dim, bias=False),
+                max_seq_len=max_seq_len,
+                attn_dropout=attn_dropout,
+                is_causal=True,
+            )
+            mlp = qwen2_mlp(dim=embed_dim, hidden_dim=hidden_dim)
+            layer = TransformerSelfAttentionLayer(
+                attn=self_attn,
+                mlp=mlp,
+                sa_norm=RMSNorm(embed_dim, eps=norm_eps),
+                mlp_norm=RMSNorm(embed_dim, eps=norm_eps),
+            )
+            layers.append(layer)
+        
+        # Decoder with no token embeddings
+        self.decoder = TransformerDecoder(
+            tok_embeddings=nn.Identity(),  # No embedding layer needed
+            layers=layers,
+            max_seq_len=max_seq_len,
+            num_heads=num_heads,
+            head_dim=head_dim,
+            norm=RMSNorm(embed_dim, eps=norm_eps),
+            output=nn.Identity(),
+        )
+        
+        # Cross-attention layers
+        self.cross_attn_layers = nn.ModuleList()
+        for _ in range(num_cross_layers):
+            cross_attn = MultiHeadAttention(
+                embed_dim=embed_dim,
+                num_heads=num_heads,
+                num_kv_heads=num_kv_heads,
+                head_dim=head_dim,
+                q_proj=nn.Linear(embed_dim, num_heads * head_dim, bias=True),
+                k_proj=nn.Linear(global_dim, num_kv_heads * head_dim, bias=True),
+                v_proj=nn.Linear(global_dim, num_kv_heads * head_dim, bias=True),
+                output_proj=nn.Linear(embed_dim, embed_dim, bias=False),
+                max_seq_len=max_seq_len,
+                attn_dropout=attn_dropout,
+                is_causal=False,
+            )
+            mlp = qwen2_mlp(dim=embed_dim, hidden_dim=hidden_dim)
+            cross_layer = TransformerCrossAttentionLayer(
+                attn=cross_attn,
+                mlp=mlp,
+                ca_norm=RMSNorm(embed_dim, eps=norm_eps),
+                mlp_norm=RMSNorm(embed_dim, eps=norm_eps),
+            )
+            self.cross_attn_layers.append(cross_layer)
+        
+        self.output = nn.Linear(embed_dim, vocab_size, bias=False)
+        self.to(dtype=dtype)
+    
+    def forward(self, byte_embeds, patch_embs, patch_ids):
+        # Pass byte embeddings directly to the decoder
+        x = self.decoder(byte_embeds, mask=None)  # Shape: [batch_size, seq_len, embed_dim]
+        x = x.to(torch.bfloat16) # TODO: Fix cast because no chunking.
+
+        # Apply cross-attention with patch embeddings
+        if self.cross_attn_layers:
+            num_patches = patch_embs.size(1)
+            mask = (
+                patch_ids.unsqueeze(2) == torch.arange(num_patches, device=byte_embeds.device).unsqueeze(0).unsqueeze(0)
+            )  # Shape: [batch_size, num_patches, seq_len]
+            for cross_layer in self.cross_attn_layers:
+                x = cross_layer(x, encoder_input=patch_embs, encoder_mask=mask)
+        
+        # Compute logits
+        logits = self.output(x)  # Shape: [batch_size, seq_len, vocab_size]
+        return logits
+
 class LocalEncoderWithPooling(nn.Module):
-    def __init__(self, base_encoder, cross_attn_layers, twox_pooling, embed_dim, global_dim):
+    def __init__(self, base_encoder, cross_attn_layers, embed_dim, global_dim):
         super().__init__()
         self.base_encoder = base_encoder
         self.cross_attn_layers = cross_attn_layers
-        self.twox_pooling = twox_pooling
+        self.patch_projector = PatchToGlobalProjector(embed_dim, global_dim) 
 
-        if twox_pooling:
-            #self.layers[0].attn.q_proj.in_features  # typically same as embed_dim but could differ
-            self.patch_projector = PatchToGlobalProjector(embed_dim * 2, global_dim)
-        else:
-            self.patch_projector = nn.Identity()
-
-    def forward(self, tokens, patch_ids):
-        # Get byte embeddings
-        byte_embeds = self.base_encoder(tokens, mask=None)
-        # TODO: remove this hack. If not using chunked output, TransformerDecoder called .float
-        # on the output, annoyingly throwing us into float32. 
+    def forward(self, bytes, patch_ids):
+        # Get byte-level embeddings from the base encoder
+        byte_embeds = self.base_encoder(bytes, mask=None)
         byte_embeds = byte_embeds.to(torch.bfloat16)
 
-        # Pool byte embeddings into patch embeddings
-        if self.twox_pooling:
-            mean_embs = patch_reduce(byte_embeds, patch_ids, reduce_op="mean")
-            max_embs  = patch_reduce(byte_embeds, patch_ids, reduce_op="amax")
-            patch_embs = torch.cat([mean_embs, max_embs], dim=-1)
-        else:
-            patch_embs = patch_reduce(byte_embeds, patch_ids, reduce_op="mean")
-
-        # Projection to global layers/cross attention.
-        patch_embs = self.patch_projector(patch_embs)
-
-        # Refine with cross-attention if present
+        # Apply cross-attention if layers exist
         if self.cross_attn_layers:
             num_patches = patch_ids.max().item() + 1
-            local_encoder_mask = (
-                patch_ids.unsqueeze(1) ==
-                torch.arange(num_patches, device=tokens.device).unsqueeze(0).unsqueeze(-1)
-            )  # [batch_size, num_patches, seq_len]
+            local_encoder_mask = (patch_ids.unsqueeze(1) == patch_ids.unsqueeze(2))  # Shape: [batch_size, seq_len, seq_len]
+            patch_embs = byte_embeds  # Start with byte embeddings
             for cross_layer in self.cross_attn_layers:
                 patch_embs = cross_layer(patch_embs, encoder_input=byte_embeds, encoder_mask=local_encoder_mask)
+        else:
+            patch_embs = byte_embeds
 
-        return patch_embs
+        # Reduce byte-level embeddings to patch-level embeddings
+        patch_embs = patch_reduce(patch_embs, patch_ids, reduce_op="mean")  # Shape: [batch_size, num_patches, embed_dim]
+
+        # Project to global dimension
+        patch_embs = self.patch_projector(patch_embs)  # Shape: [batch_size, num_patches, global_dim]
+
+        return byte_embeds, patch_embs  # Return both byte embeddings and reduced patch embeddings
 
 def build_local_encoder(
     global_dim: int,
-    vocab_size: int = 256,
+    vocab_size: int = VOCAB_SIZE,
     embed_dim: int = 2048,
     num_heads: int = 8,
     num_kv_heads: int = 8,
@@ -75,19 +268,23 @@ def build_local_encoder(
     attn_dropout: float = 0.0,
     max_seq_len: int = 2048,
     num_layers: int = 4,
-    num_cross_layers = 1,
-    twox_pooling: bool = False,
-    dtype=torch.bfloat16
+    num_cross_layers = 4,
+    dtype=torch.bfloat16,
+    use_hash_ngrams=True,
+    max_ngram: int = 8, 
+    num_ngram_buckets: int = 500000, 
 ):
-    """
-    Build a local "encoder" using torchtune's TransformerDecoder, but with:
-      - no cross-attention
-      - self-attention only
-      - Qwen2 MLP style
-      - final RMS norm and no output projection (Identity)
-    """
     head_dim = embed_dim // num_heads
-    tok_embeddings = nn.Embedding(vocab_size, embed_dim)
+
+    if use_hash_ngrams:
+        tok_embeddings = HashNGramEmbedder(
+            embed_dim=embed_dim,
+            max_n=max_ngram,
+            num_buckets=num_ngram_buckets,
+            vocab_size=vocab_size
+        )
+    else:
+        tok_embeddings = nn.Embedding(vocab_size, embed_dim)
 
     # Build self-attention layers with Qwen MLP
     layers = nn.ModuleList()
@@ -150,7 +347,7 @@ def build_local_encoder(
         )
         cross_attn_layers.append(cross_layer)
     
-    local_encoder = LocalEncoderWithPooling(base_encoder, cross_attn_layers, twox_pooling, embed_dim, global_dim)
+    local_encoder = LocalEncoderWithPooling(base_encoder, cross_attn_layers, embed_dim, global_dim)
     return local_encoder.to(dtype=dtype)
 
 ################################################
@@ -171,7 +368,7 @@ def compute_local_entropy(bytes_tensor, window_size=8):
     batch_size, seq_len = bytes_tensor.shape
     
     # We’ll keep a sliding frequency table. Initialize all zeros:
-    freq = torch.zeros(batch_size, 256, device=device)
+    freq = torch.zeros(batch_size, VOCAB_SIZE, device=device)
     local_entropy = torch.zeros(batch_size, seq_len, device=device)
     
     for pos in range(seq_len):
@@ -369,7 +566,7 @@ class ByteLatentQwen2p5Decoder(TransformerDecoder):
 
         output = nn.Linear(
             qwen_cfg['embed_dim'],
-            256,  # bytes
+            VOCAB_SIZE  ,  # bytes
             bias=False,
         )
         # Initialize output bytes. 
@@ -382,24 +579,40 @@ class ByteLatentQwen2p5Decoder(TransformerDecoder):
                 a=-3*init_std,
                 b=3*init_std,
             )
-        byte_embedding = nn.Embedding(256, qwen_cfg["embed_dim"])
 
+        output = nn.Identity()  # Global transformer doesn’t output logits
+        emb = nn.Identity()
         super().__init__(
-            tok_embeddings=byte_embedding,
+            tok_embeddings=emb,
             layers=layers,
             max_seq_len=qwen_cfg['max_seq_len'],
             num_heads=qwen_cfg['num_heads'],
             head_dim=head_dim,
             norm=RMSNorm(qwen_cfg['embed_dim'], eps=qwen_cfg['norm_eps']),
-            # We are overriding this to be bytes, ignoring the tokenizer. 
             output=output,
         )
-
-        if cross_attend_layers is None:
-            cross_attend_layers = [qwen_cfg["num_layers"] - 1]  # e.g. only final layer
-        self._inject_cross_attn(self, qwen_cfg, cross_attend_layers)
-
         self.local_encoder = build_local_encoder(**local_encoder_cfg, global_dim=qwen_cfg['embed_dim'])
+        self.local_decoder = LocalDecoder(
+            embed_dim=qwen_cfg['embed_dim'],
+            global_dim=qwen_cfg['embed_dim'],
+            vocab_size=VOCAB_SIZE,
+        )
+
+         # Collect parameters for different learning rates
+        self.qwen_params = []
+        self.new_params = []
+
+        # Qwen parts
+        self.qwen_params.extend(self.norm.parameters())
+        for layer in self.layers:
+            if isinstance(layer, TransformerSelfAttentionLayer):
+                self.qwen_params.extend(layer.parameters())
+
+        # New parts
+        self.new_params.extend(self.tok_embeddings.parameters())
+        self.new_params.extend(self.output.parameters())
+        self.new_params.extend(self.local_encoder.parameters())
+        self.new_params.extend(self.local_decoder.parameters())
 
         self.patch_size = patch_size
         self.patching_threshold = patching_threshold
@@ -412,83 +625,10 @@ class ByteLatentQwen2p5Decoder(TransformerDecoder):
         # We'll store how many chunks the user wants for final output
         self.num_output_chunks = 0  # default
 
-        # Collect parameters for different learning rates
-        self.qwen_params = []
-        self.new_params = []
-
-        # Qwen parts
-        self.qwen_params.extend(self.norm.parameters())
-        for layer in self.layers:
-            if isinstance(layer, TransformerSelfAttentionLayer):
-                self.qwen_params.extend(layer.parameters())
-            elif isinstance(layer, FusionLayer):
-                self.qwen_params.extend(layer.layer.parameters())
-                # New cross-attention parts
-                self.new_params.extend(layer.fusion_layer.parameters())
-
-        # New parts
-        self.new_params.extend(self.tok_embeddings.parameters())
-        self.new_params.extend(self.output.parameters())
-        self.new_params.extend(self.local_encoder.parameters())
-
-    def _inject_cross_attn(
-        self,
-        decoder: TransformerDecoder,
-        qwen_cfg: Dict[str, Any],
-        cross_attend_layers: List[int],
-    ):
-        """
-        Wraps each designated Qwen layer in a FusionLayer that adds a cross-attn
-        sub-layer after self-attn. The new cross-attn weights won't match any
-        pretrained checkpoint keys, so they'll be randomly initialized.
-        """
-        embed_dim = qwen_cfg["embed_dim"]
-        num_heads = qwen_cfg["num_heads"]
-        num_kv_heads = qwen_cfg["num_kv_heads"]
-        head_dim = embed_dim // num_heads
-
-        for idx in cross_attend_layers:
-            old_layer = decoder.layers[idx]
-
-            # Build a cross-attn sub-layer
-            cross_attn = MultiHeadAttention(
-                embed_dim=embed_dim,
-                num_heads=num_heads,
-                num_kv_heads=num_kv_heads,
-                head_dim=head_dim,
-                q_proj=nn.Linear(embed_dim, num_heads * head_dim, bias=True),
-                k_proj=nn.Linear(embed_dim, num_kv_heads * head_dim, bias=True),
-                v_proj=nn.Linear(embed_dim, num_kv_heads * head_dim, bias=True),
-                output_proj=nn.Linear(embed_dim, embed_dim, bias=False),
-                attn_dropout=qwen_cfg["attn_dropout"],
-                is_causal=False,  # cross-attn is typically non-causal\
-            )
-            cross_mlp = qwen2_mlp(dim=embed_dim, hidden_dim=qwen_cfg["intermediate_dim"])
-            cross_layer = TransformerCrossAttentionLayer(
-                attn=cross_attn,
-                mlp=cross_mlp,
-                ca_norm=RMSNorm(embed_dim, eps=qwen_cfg["norm_eps"]),
-                mlp_norm=RMSNorm(embed_dim, eps=qwen_cfg["norm_eps"]),
-            )
-            fused = FusionLayer(
-                layer=old_layer,       # existing self-attn + MLP
-                fusion_layer=cross_layer,
-                fusion_first=False,    # do self-attn first, then cross-attn
-            )
-            decoder.layers[idx] = fused  # replace it in place
-
     def _update_freezing(self):
         if self.global_frozen:
-            for param in self.norm.parameters():
+            for param in self.qwen_params:
                 param.requires_grad = False
-            for layer in self.layers:
-                if isinstance(layer, TransformerSelfAttentionLayer):
-                    for param in layer.parameters():
-                        param.requires_grad = False
-                elif isinstance(layer, FusionLayer):
-                    for param in layer.layer.parameters():
-                        param.requires_grad = False
-                    # fusion_layer parameters remain requires_grad = True
         else:
             for param in self.parameters():
                 param.requires_grad = True
@@ -505,6 +645,7 @@ class ByteLatentQwen2p5Decoder(TransformerDecoder):
         encoder_input: Optional[torch.Tensor] = None,
         encoder_mask: Optional[torch.Tensor] = None,
         input_pos: Optional[torch.Tensor] = None,
+        patch_ids: Optional[torch.Tensor] = None,
     ) -> Union[torch.Tensor, List[torch.Tensor]]:
         # Update freezing state if in training
         if self.training and self.global_frozen:
@@ -512,147 +653,122 @@ class ByteLatentQwen2p5Decoder(TransformerDecoder):
             if self.current_step >= self.freeze_global_for_n_steps:
                 self.global_frozen = False
                 self._update_freezing()
-        
-        # Compute patch IDs
-        patch_ids, tok_scores = dynamic_patch(
-            tokens, threshold=self.patching_threshold, patch_size=self.patch_size
-        ) 
 
-        # Get patch embeddings from local encoder
-        patch_embs = self.local_encoder(tokens, patch_ids=patch_ids)
-        
-        # Compute decoder cross-attention mask
-        batch_size, seq_len = tokens.shape
-        num_patches = patch_embs.size(1)
-        decoder_cross_mask = torch.zeros(
-            batch_size, seq_len, num_patches, dtype=torch.bool, device=tokens.device
-        )
-        decoder_cross_mask[
-            torch.arange(batch_size)[:, None],
-            torch.arange(seq_len)[None, :],
-            patch_ids
-        ] = True
-        # this is a list of chunk x [b, num_patches, 256]
-        local_logits = super().forward(
-            tokens,        
-            mask=mask,
-            encoder_input=patch_embs,
-            encoder_mask=decoder_cross_mask,
-            input_pos=input_pos,
-        )
-
-        # Super handles chunking
-        return local_logits
+        if patch_ids is None:
+            patch_ids, _ = dynamic_patch(tokens, threshold=self.patching_threshold, patch_size=self.patch_size)
     
-    def generate_with_patches(
+        byte_embeds, patch_embs = self.local_encoder(tokens, patch_ids=patch_ids)
+        global_out = super().forward(patch_embs, mask=mask, input_pos=input_pos) 
+        
+        # Assuming the outs are chunked, take entry[0] of outputs.
+        logits = self.local_decoder(byte_embeds, global_out[0], patch_ids)
+        return logits
+
+    def unified_generate(
         self,
         prompt: Union[torch.LongTensor, List[int]],
         max_new_tokens: int = 128,
-        eos_id: int = EOS_ID,    # your EOS_ID
+        eos_id: int = EOS_ID,
+        use_patches: bool = False,
         threshold: float = 3.0,
         max_patch_size: int = 8,
-        temperature: float = 1.0,
-        top_k: int = 0
-    ) -> List[int]:
-        """
-        Generate up to `max_new_tokens` bytes using patch-based decoding.
-        We'll do a single forward pass for each 'patch' chunk, hopefully bigger than 1 byte
-        for efficiency. We do a simple step-by-step sampling inside that patch.
-
-        Args:
-            prompt: initial list of bytes or a tensor shaped [seq_len]
-            max_new_tokens: total new bytes to produce
-            eos_id: ID for end-of-sequence
-            threshold: local entropy threshold for dynamic patch size
-            max_patch_size: maximum patch chunk we consider
-            temperature, top_k: sampling hyperparams
-
-        Returns:
-            all_tokens: a list of all bytes (prompt + newly generated)
-        """
+        temperature: float = 0.7,
+        top_k: int = 50,
+        top_p: float = 0.9,
+        frequency_penalty: float = 0.1,
+        repetition_penalty: float = 1.5,
+        greedy: bool = False,
+    ) -> torch.Tensor:
+        # 1) Convert prompt to a tensor [1, seq_len]
         if isinstance(prompt, list):
             prompt = torch.tensor(prompt, dtype=torch.long, device=next(self.parameters()).device)
         if prompt.dim() == 1:
-            prompt = prompt.unsqueeze(0)  # shape [1, seq_len]
+            prompt = prompt.unsqueeze(0) # Add a batch dimension.
 
+        device = prompt.device
         all_tokens = prompt.clone()
 
-        # We'll keep track of how many new tokens we've added
-        generated_count = 0
+        # Track usage for freq / repetition penalty
+        token_counts = torch.bincount(all_tokens[0], minlength=VOCAB_SIZE).to(device)
+        #token_counts = torch.bincount(all_tokens, minlength=256).to(device)
+        recent_tokens = []
 
-        while generated_count < max_new_tokens:
-            patch_len = compute_patch_size(all_tokens, threshold=threshold, max_patch=max_patch_size)
-            # Avoid going beyond max_new_tokens
-            patch_len = min(patch_len, max_new_tokens - generated_count)
-            if patch_len <= 0:
-                break
+        # Start generating
+        for step_i in range(max_new_tokens):
 
-            current_seq_len = all_tokens.size(1)
-            # The model will produce logits for positions [current_seq_len .. current_seq_len + patch_len - 1]
-            # We can do that in a single pass by passing the entire tokens so far, extended with 
-            # some placeholder for the next 'patch_len' bytes. We'll fill them in step-by-step from the logits.
+            # If we are using patches, then compute patch_ids from the entire sequence
+            if use_patches:
+                with torch.no_grad():
+                    patch_ids, _ = dynamic_patch(all_tokens, threshold=threshold, patch_size=max_patch_size)
+                    logits = self.forward(all_tokens, patch_ids=patch_ids)
+            else:
+                # No patching => standard forward
+                with torch.no_grad():
+                    logits = self.forward(all_tokens)
 
-            fill_value = 0  # default
-            if hasattr(self.tok_embeddings, "padding_idx") and (self.tok_embeddings.padding_idx is not None):
-                fill_value = self.tok_embeddings.padding_idx
+            if isinstance(logits, list):
+                logits = torch.cat(logits, dim=1)
+            step_logits = logits[0, -1, :]
 
-            # We'll create a new input, same as all_tokens, with 'patch_len' dummy tokens appended (e.g. pad_id).
-            # shape => [1, current_seq_len + patch_len]
-            padded_input = torch.cat([
-                all_tokens, 
-                torch.full(
-                    (1, patch_len), 
-                    fill_value=fill_value, 
-                    device=all_tokens.device, 
-                    dtype=all_tokens.dtype)
-            ], dim=1)
+            # Apply temperature
+            if temperature != 1.0:
+                step_logits = step_logits / temperature
 
-            # Now do a forward pass
-            with torch.no_grad():
-                # The model returns logits for each position in [B, T, 256]
-                logits = self.forward(padded_input)  # shape [1, T, 256]
-                # Chunked.
-                if isinstance(logits, list):
-                    logits = torch.cat(logits, dim=1)  # [1, T, 256]
-            
-            new_positions_logits = logits[0, current_seq_len : current_seq_len + patch_len, :]
+            # Repetition penalty
+            for tk in recent_tokens:
+                step_logits[tk] /= repetition_penalty
 
-            # Inside a patch do step-by-step sampling from the stored logits
-            new_tokens = []
-            for i in range(patch_len):
-                step_logits = new_positions_logits[i]  # shape [256]
-                # Possibly adjust for temperature
-                if temperature != 1.0:
-                    step_logits = step_logits / temperature
-                
-                # Possibly do top_k
-                if top_k > 0:
-                    # topk filter
-                    values, indices = torch.topk(step_logits, top_k)
-                    topk_mask = torch.ones_like(step_logits, dtype=torch.bool)
-                    topk_mask[indices] = False
-                    step_logits[topk_mask] = float('-inf')
+            # Frequency penalty
+            step_logits -= token_counts * frequency_penalty
 
-                probs = step_logits.softmax(dim=-1)
-                next_token = torch.multinomial(probs, num_samples=1).item()
+            # top-k
+            if top_k > 0:
+                vals, idxs = torch.topk(step_logits, top_k)
+                mask = torch.ones_like(step_logits, dtype=torch.bool)
+                mask[idxs] = False
+                step_logits[mask] = float('-inf')
 
-                new_tokens.append(next_token)
+            # top-p
+            probs = torch.softmax(step_logits, dim=-1)
+            sorted_probs, sorted_indices = torch.sort(probs, descending=True)
+            cdf = torch.cumsum(sorted_probs, dim=-1)
+            exceed = (cdf > top_p).nonzero(as_tuple=True)[0]
+            if exceed.numel() > 0:
+                first_exceed = exceed[0].item()
+                if first_exceed + 1 < probs.size(-1):
+                    # zero out everything after the nucleus
+                    probs[sorted_indices[first_exceed+1:]] = 0
 
-                # If EOS, we can end generation altogether
-                if next_token == eos_id:
-                    patch_len = i + 1  # we actually only used i+1 steps
-                    break
+            # Re‐normalize
+            total_p = probs.sum()
+            if total_p > 0:
+                probs /= total_p
+            else:
+                probs = torch.ones_like(probs) / probs.size(-1)
 
-            new_tokens_t = torch.tensor(new_tokens, dtype=all_tokens.dtype, device=all_tokens.device).unsqueeze(0)
-            all_tokens = torch.cat([all_tokens, new_tokens_t], dim=1)
-            generated_count += len(new_tokens)
+            # Next token
+            if greedy:
+                next_token = torch.argmax(probs).item()
+            else:
+                next_token = torch.multinomial(probs, 1).item()
 
-            # If we hit eos in the middle of the patch, break
-            if new_tokens and new_tokens[-1] == eos_id:
+            # Add new token
+            all_tokens = torch.cat(
+                [all_tokens, torch.tensor([[next_token]], device=device)],
+                dim=1,
+            )
+
+            # Update counters
+            token_counts[next_token] += 1
+            recent_tokens.append(next_token)
+            if len(recent_tokens) > 5:
+                recent_tokens.pop(0)
+
+            # EOS break
+            if next_token == eos_id:
                 break
 
         return all_tokens
-
 
 ############################
 # Tokenizer
@@ -694,7 +810,7 @@ class ByteLatentModelTokenizer(nn.Module):
         return tokens
 
     def decode(self, tokens: List[int]) -> str:
-        # naive decode
+        # naive decode - skip special tokens
         return bytes([t for t in tokens if t < 256]).decode("utf-8", errors="ignore")
 
 
@@ -745,8 +861,9 @@ def blt_tokenizer(
 def qwen2_5_blt(
     # Warm up decoder/encoder. Tried it with both 100 and 0 and it seemed to work better without
     # the warmup, but never tested a longer warmup. 
-    freeze_global_for_n_steps=500, 
-    twox_pooling=True,
+    freeze_global_for_n_steps=500,
+    use_hash_ngrams=True,
+    patch_size=4,
 ) -> ByteLatentQwen2p5Decoder:
     qwen_cfg = dict(
         vocab_size=151936, # Kinda irrelevant
@@ -761,7 +878,7 @@ def qwen2_5_blt(
     )
 
     local_enc_cfg = dict(
-        vocab_size=256, 
+        vocab_size=VOCAB_SIZE, 
         embed_dim=2048, # Keeping same as Qwen
         num_layers=4,
         num_heads=8,
@@ -769,19 +886,16 @@ def qwen2_5_blt(
         max_seq_len=4096,
         hidden_dim=4096,
         norm_eps=1e-5,
-        num_cross_layers = 1,
-        twox_pooling = twox_pooling,
+        num_cross_layers = 4,
+        use_hash_ngrams=use_hash_ngrams,
+        max_ngram= 8, 
+        num_ngram_buckets=500000, 
     )
 
     return ByteLatentQwen2p5Decoder(
         qwen_cfg=qwen_cfg,
         local_encoder_cfg=local_enc_cfg,
-        patch_size=4,
+        patch_size=patch_size,
         patching_threshold=3.0,
-        freeze_global_for_n_steps=freeze_global_for_n_steps,
-        # Cross-attending every other layer to reduce memory usage. 
-        # cross_attend_layers=list(range(0, qwen_cfg["num_layers"], 2))
-        cross_attend_layers=list(range(0, qwen_cfg["num_layers"], 3)),
-        # Alt last 6 layers
-        # cross_attend_layers=range(qwen_cfg["num_layers"] - 6, qwen_cfg["num_layers"])
+        freeze_global_for_n_steps=freeze_global_for_n_steps
     )

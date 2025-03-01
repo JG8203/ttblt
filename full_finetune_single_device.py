@@ -671,7 +671,7 @@ class FullFinetuneRecipeSingleDevice(FTRecipeInterface):
             logits = self._model(**batch)
 
         # Shift labels to compute loss
-        # equivalent to doing labels[..., 1:] and logits[..., :-1, :]
+        # equivalent to doing labels[..., 1:] a nd logits[..., :-1, :]
         # But this way we dont need to slice the logits. We just add an ignore index to labels.
         labels = torch.hstack(
             (labels[..., 1:], self.ignore_labels_cache[: labels.shape[0]])
