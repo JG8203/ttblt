@@ -42,8 +42,8 @@ class HashNGramEmbedder(nn.Module):
         embed_dim: int = 2048,
         max_n: int = 8,
         num_buckets: int = 500_000,
-        vocab_size: int = 256,
-        hash_base: int = 257,
+        vocab_size: int = VOCAB_SIZE,
+        hash_base: int = 0,
         hash_mod: int = 2**23,
         shared_table: bool = True  # switchable mode
     ):
@@ -52,6 +52,8 @@ class HashNGramEmbedder(nn.Module):
         self.max_n = max_n
         self.num_buckets = num_buckets
         self.hash_base = hash_base
+        if (self.hash_base == 0):
+            self.hash_base = vocab_size + 1
         self.hash_mod = hash_mod
         self.shared_table = shared_table
 
@@ -139,7 +141,7 @@ class LocalDecoder(nn.Module):
         hidden_dim: int = 4096,
         norm_eps: float = 1e-5,
         attn_dropout: float = 0.0,
-        max_seq_len: int = 2048,
+        max_seq_len: int = 4096,
         dtype=torch.bfloat16,
     ):
         super().__init__()
@@ -241,7 +243,7 @@ class LocalEncoderWithPooling(nn.Module):
 
         # Apply cross-attention if layers exist
         if self.cross_attn_layers:
-            num_patches = patch_ids.max().item() + 1
+            # num_patches = patch_ids.max().item() + 1
             local_encoder_mask = (patch_ids.unsqueeze(1) == patch_ids.unsqueeze(2))  # Shape: [batch_size, seq_len, seq_len]
             patch_embs = byte_embeds  # Start with byte embeddings
             for cross_layer in self.cross_attn_layers:
@@ -536,7 +538,6 @@ class ByteLatentQwen2p5Decoder(TransformerDecoder):
         patch_size: int = 4,
         patching_threshold: float = 3.0,
         freeze_global_for_n_steps: int = 0,
-        cross_attend_layers: Optional[List[int]] = None,
     ):
         layers = nn.ModuleList()
         head_dim = qwen_cfg['embed_dim'] // qwen_cfg['num_heads']
@@ -596,6 +597,7 @@ class ByteLatentQwen2p5Decoder(TransformerDecoder):
             embed_dim=qwen_cfg['embed_dim'],
             global_dim=qwen_cfg['embed_dim'],
             vocab_size=VOCAB_SIZE,
+            max_seq_len=local_encoder_cfg['max_seq_len'],
         )
 
          # Collect parameters for different learning rates
@@ -658,10 +660,16 @@ class ByteLatentQwen2p5Decoder(TransformerDecoder):
             patch_ids, _ = dynamic_patch(tokens, threshold=self.patching_threshold, patch_size=self.patch_size)
     
         byte_embeds, patch_embs = self.local_encoder(tokens, patch_ids=patch_ids)
-        global_out = super().forward(patch_embs, mask=mask, input_pos=input_pos) 
+        global_out = super().forward(patch_embs, mask=mask, input_pos=input_pos)
         
         # Assuming the outs are chunked, take entry[0] of outputs.
-        logits = self.local_decoder(byte_embeds, global_out[0], patch_ids)
+        if self.num_output_chunks == 0:
+            global_out = global_out.to(torch.bfloat16) # TODO: Another fix for the 0 chunk float. Need to move this dtype definiton.  
+            logits = self.local_decoder(byte_embeds, global_out, patch_ids)
+        else: 
+            global_out_combined = torch.cat(global_out, dim=1) # Unchunking - it would be better not to pass this through I think. 
+            clogits = self.local_decoder(byte_embeds, global_out_combined, patch_ids)
+            logits = [chunk for chunk in clogits.chunk(self.num_output_chunks, dim=1)]
         return logits
 
     def unified_generate(
@@ -669,12 +677,9 @@ class ByteLatentQwen2p5Decoder(TransformerDecoder):
         prompt: Union[torch.LongTensor, List[int]],
         max_new_tokens: int = 128,
         eos_id: int = EOS_ID,
-        use_patches: bool = False,
-        threshold: float = 3.0,
-        max_patch_size: int = 8,
         temperature: float = 0.7,
         top_k: int = 50,
-        top_p: float = 0.9,
+        top_p: float = 0,
         frequency_penalty: float = 0.1,
         repetition_penalty: float = 1.5,
         greedy: bool = False,
@@ -690,21 +695,14 @@ class ByteLatentQwen2p5Decoder(TransformerDecoder):
 
         # Track usage for freq / repetition penalty
         token_counts = torch.bincount(all_tokens[0], minlength=VOCAB_SIZE).to(device)
-        #token_counts = torch.bincount(all_tokens, minlength=256).to(device)
         recent_tokens = []
 
         # Start generating
         for step_i in range(max_new_tokens):
 
-            # If we are using patches, then compute patch_ids from the entire sequence
-            if use_patches:
-                with torch.no_grad():
-                    patch_ids, _ = dynamic_patch(all_tokens, threshold=threshold, patch_size=max_patch_size)
-                    logits = self.forward(all_tokens, patch_ids=patch_ids)
-            else:
-                # No patching => standard forward
-                with torch.no_grad():
-                    logits = self.forward(all_tokens)
+            # No patching => standard forward
+            with torch.no_grad():
+                logits = self.forward(all_tokens)
 
             if isinstance(logits, list):
                 logits = torch.cat(logits, dim=1)
@@ -730,16 +728,16 @@ class ByteLatentQwen2p5Decoder(TransformerDecoder):
 
             # top-p
             probs = torch.softmax(step_logits, dim=-1)
-            sorted_probs, sorted_indices = torch.sort(probs, descending=True)
-            cdf = torch.cumsum(sorted_probs, dim=-1)
-            exceed = (cdf > top_p).nonzero(as_tuple=True)[0]
-            if exceed.numel() > 0:
-                first_exceed = exceed[0].item()
-                if first_exceed + 1 < probs.size(-1):
-                    # zero out everything after the nucleus
-                    probs[sorted_indices[first_exceed+1:]] = 0
+            if top_p > 0:
+                sorted_logits, sorted_indices = torch.sort(step_logits, descending=True)
+                cumulative_probs = torch.cumsum(probs, dim=-1)
+                sorted_indices_to_remove = cumulative_probs > top_p
+                sorted_indices_to_remove[:, 1:] = sorted_indices_to_remove[:, :-1].clone()
+                sorted_indices_to_remove[:, 0] = 0
+                indices_to_remove = sorted_indices[sorted_indices_to_remove]
+                step_logits = step_logits.scatter(-1, indices_to_remove, -1e9)
 
-            # Re‐normalize
+            # Re‐normalize            
             total_p = probs.sum()
             if total_p > 0:
                 probs /= total_p
@@ -864,6 +862,7 @@ def qwen2_5_blt(
     freeze_global_for_n_steps=500,
     use_hash_ngrams=True,
     patch_size=4,
+    max_seq_len=4096
 ) -> ByteLatentQwen2p5Decoder:
     qwen_cfg = dict(
         vocab_size=151936, # Kinda irrelevant
@@ -871,7 +870,7 @@ def qwen2_5_blt(
         num_layers=36,
         num_heads=16,
         num_kv_heads=2,
-        max_seq_len=32768,
+        max_seq_len=max_seq_len,
         intermediate_dim=11008,
         attn_dropout=0.0,
         norm_eps=1e-6,
@@ -883,7 +882,7 @@ def qwen2_5_blt(
         num_layers=4,
         num_heads=8,
         num_kv_heads=8,
-        max_seq_len=4096,
+        max_seq_len=max_seq_len,
         hidden_dim=4096,
         norm_eps=1e-5,
         num_cross_layers = 4,

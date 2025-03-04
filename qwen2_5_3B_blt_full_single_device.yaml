@@ -41,8 +41,8 @@ shuffle: True
 model:
   _component_: ttblt.bltqwen.qwen2_5_blt
   freeze_global_for_n_steps: 500 # Warm up encoders first. 
-  use_hash_ngrams: 0
-  patch_size: 4
+  use_hash_ngrams: 1
+  patch_size: 8
 
 checkpointer:
   _component_: torchtune.training.FullModelHFCheckpointer
