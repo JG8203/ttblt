@@ -1,0 +1,37 @@
+# Config for generation using a fine-tuned model
+
+# Tokenizer
+tokenizer:
+  _component_: ttblt.bltqwen.blt_tokenizer
+  max_seq_len: 4096
+
+# Model Arguments
+model:
+  _component_: ttblt.bltqwen.qwen2_5_blt
+  use_hash_ngrams: 1
+  patch_size: 8
+
+checkpointer:
+  _component_: torchtune.training.FullModelTorchTuneCheckpointer
+  checkpoint_path: /tmp/torchtune/qwen2_5_3B_blt_custom_data/full_single_device/adapter_model_epoch_0.pt
+  recipe_checkpoint: null
+  output_dir: /tmp/torchtune/qwen2_5_3B_blt_custom_data/full_single_device
+  model_type: QWEN2
+
+# Generation arguments
+prompt:
+  user: "Kumportableng pag-upo lang sana yon sa loob ng sasakyan habang bumibiyahe ."
+  system: null
+max_new_tokens: 200
+enable_kv_cache: True
+
+# Training environment
+device: cuda:1
+
+# Reduced precision
+dtype: bf16
+
+# Quantizer
+quantizer: null
+
+seed: 1234
